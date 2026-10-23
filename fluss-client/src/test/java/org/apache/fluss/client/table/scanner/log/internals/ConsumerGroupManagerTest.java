@@ -30,8 +30,12 @@ import org.apache.fluss.rpc.messages.CommitConsumerOffsetsRequest;
 import org.apache.fluss.rpc.messages.CommitConsumerOffsetsResponse;
 import org.apache.fluss.rpc.messages.FindConsumerGroupOwnerRequest;
 import org.apache.fluss.rpc.messages.FindConsumerGroupOwnerResponse;
+import org.apache.fluss.rpc.messages.GetConsumerOffsetsRequest;
+import org.apache.fluss.rpc.messages.GetConsumerOffsetsResponse;
 import org.apache.fluss.rpc.messages.PbCommitConsumerOffsetsResponseBucket;
 import org.apache.fluss.rpc.messages.PbCommitConsumerOffsetsResponseTable;
+import org.apache.fluss.rpc.messages.PbGetConsumerOffsetsResponseBucket;
+import org.apache.fluss.rpc.messages.PbGetConsumerOffsetsResponseTable;
 import org.apache.fluss.rpc.messages.PbServerNode;
 import org.apache.fluss.rpc.protocol.Errors;
 import org.apache.fluss.server.tablet.TestTabletServerGateway;
@@ -45,6 +49,7 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.ExecutionException;
@@ -350,6 +355,160 @@ class ConsumerGroupManagerTest {
         assertThat(time.milliseconds()).isEqualTo(10L);
     }
 
+    @Test
+    void testFetchCommittedOffsetsEncodesStableRequestAndDecodesResponse() {
+        AtomicReference<GetConsumerOffsetsRequest> captured = new AtomicReference<>();
+        TestTabletServerGateway gateway =
+                gateway(
+                        request ->
+                                CompletableFuture.completedFuture(
+                                        ownerResponse(TestingMetadataUpdater.NODE2)),
+                        request ->
+                                CompletableFuture.completedFuture(
+                                        new CommitConsumerOffsetsResponse()),
+                        request -> {
+                            captured.set(request);
+                            return CompletableFuture.completedFuture(fetchResponse());
+                        });
+        ManualTime time = new ManualTime();
+        ConsumerGroupManager manager =
+                new ConsumerGroupManager("group-1", metadataUpdater(gateway), time, 10L);
+        Set<TableBucket> buckets =
+                new java.util.LinkedHashSet<>(
+                        Arrays.asList(
+                                new TableBucket(2L, null, 3),
+                                new TableBucket(1L, 5L, 2),
+                                new TableBucket(1L, null, 1)));
+
+        Map<TableBucket, OffsetMetadata> offsets =
+                manager.fetchCommittedOffsets(buckets, time.timer(100L));
+
+        GetConsumerOffsetsRequest request = captured.get();
+        assertThat(request.getGroupId()).isEqualTo("group-1");
+        assertThat(request.isAllOffsets()).isFalse();
+        assertThat(request.getTablesList()).hasSize(2);
+        assertThat(request.getTablesList().get(0).getTableId()).isEqualTo(1L);
+        assertThat(request.getTablesList().get(0).getBucketsList())
+                .extracting(bucket -> bucket.getBucketId())
+                .containsExactly(1, 2);
+        assertThat(request.getTablesList().get(1).getTableId()).isEqualTo(2L);
+        assertThat(offsets)
+                .containsEntry(new TableBucket(1L, null, 1), new OffsetMetadata(11L, "first"))
+                .containsEntry(new TableBucket(1L, 5L, 2), new OffsetMetadata(12L, "partitioned"));
+        assertThat(offsets).doesNotContainKey(new TableBucket(2L, null, 3));
+        assertThatThrownBy(offsets::clear).isInstanceOf(UnsupportedOperationException.class);
+    }
+
+    @Test
+    void testFetchTimeoutReusesSameInFlightRequest() {
+        CompletableFuture<GetConsumerOffsetsResponse> response = new CompletableFuture<>();
+        AtomicInteger fetches = new AtomicInteger();
+        TestTabletServerGateway gateway =
+                gateway(
+                        request ->
+                                CompletableFuture.completedFuture(
+                                        ownerResponse(TestingMetadataUpdater.NODE2)),
+                        request ->
+                                CompletableFuture.completedFuture(
+                                        new CommitConsumerOffsetsResponse()),
+                        request -> {
+                            fetches.incrementAndGet();
+                            return response;
+                        });
+        AdvancingTime time = new AdvancingTime();
+        ConsumerGroupManager manager =
+                new ConsumerGroupManager("group-1", metadataUpdater(gateway), time, 0L);
+        Set<TableBucket> buckets = Collections.singleton(new TableBucket(1L, null, 0));
+
+        assertThat(manager.fetchCommittedOffsets(buckets, time.timer(1L))).isNull();
+        response.complete(fetchResponse());
+        assertThat(manager.fetchCommittedOffsets(buckets, time.timer(100L))).isNotNull();
+        assertThat(fetches).hasValue(1);
+    }
+
+    @Test
+    void testFetchOwnerErrorInvalidatesCachedOwner() throws Exception {
+        AtomicInteger discoveries = new AtomicInteger();
+        AtomicInteger fetches = new AtomicInteger();
+        TestTabletServerGateway gateway =
+                gateway(
+                        request -> {
+                            discoveries.incrementAndGet();
+                            return CompletableFuture.completedFuture(
+                                    ownerResponse(TestingMetadataUpdater.NODE2));
+                        },
+                        request ->
+                                CompletableFuture.completedFuture(
+                                        new CommitConsumerOffsetsResponse()),
+                        request ->
+                                CompletableFuture.completedFuture(
+                                        fetches.getAndIncrement() == 0
+                                                ? fetchErrorResponse(
+                                                        Errors.NOT_CONSUMER_GROUP_OWNER)
+                                                : fetchResponse()));
+        ManualTime time = new ManualTime();
+        ConsumerGroupManager manager =
+                new ConsumerGroupManager("group-1", metadataUpdater(gateway), time, 10L);
+
+        assertThat(
+                        manager.fetchCommittedOffsets(
+                                Collections.singleton(new TableBucket(1L, null, 0)),
+                                time.timer(100L)))
+                .isNotNull();
+        assertThat(discoveries).hasValue(2);
+        assertThat(fetches).hasValue(2);
+    }
+
+    @Test
+    void testAutoCommitHonorsConfigurationAndInterval() {
+        AtomicInteger commits = new AtomicInteger();
+        TestTabletServerGateway gateway =
+                gateway(
+                        request ->
+                                CompletableFuture.completedFuture(
+                                        ownerResponse(TestingMetadataUpdater.NODE2)),
+                        request -> {
+                            commits.incrementAndGet();
+                            return CompletableFuture.completedFuture(
+                                    new CommitConsumerOffsetsResponse());
+                        });
+        ManualTime time = new ManualTime();
+        ConsumerGroupManager enabled =
+                new ConsumerGroupManager("group-1", metadataUpdater(gateway), time, 10L, true, 50L);
+
+        assertThat(enabled.maybeAutoCommitOffsetsAsync(49L, sampleOffsets())).isFalse();
+        assertThat(enabled.maybeAutoCommitOffsetsAsync(50L, sampleOffsets())).isTrue();
+        assertThat(enabled.maybeAutoCommitOffsetsAsync(99L, sampleOffsets())).isFalse();
+        assertThat(enabled.maybeAutoCommitOffsetsAsync(100L, sampleOffsets())).isTrue();
+        assertThat(commits).hasValue(2);
+
+        ConsumerGroupManager disabled =
+                new ConsumerGroupManager("group-1", metadataUpdater(gateway), time, 10L, false, 0L);
+        assertThat(disabled.maybeAutoCommitOffsetsAsync(1000L, sampleOffsets())).isFalse();
+        assertThat(commits).hasValue(2);
+    }
+
+    @Test
+    void testFinalAutoCommitIsNoOpWhenDisabled() {
+        AtomicInteger commits = new AtomicInteger();
+        TestTabletServerGateway gateway =
+                gateway(
+                        request ->
+                                CompletableFuture.completedFuture(
+                                        ownerResponse(TestingMetadataUpdater.NODE2)),
+                        request -> {
+                            commits.incrementAndGet();
+                            return CompletableFuture.completedFuture(
+                                    new CommitConsumerOffsetsResponse());
+                        });
+        ManualTime time = new ManualTime();
+        ConsumerGroupManager manager =
+                new ConsumerGroupManager("group-1", metadataUpdater(gateway), time, 10L, false, 0L);
+
+        assertThat(manager.maybeAutoCommitOffsetsSync(sampleOffsets(), time.timer(100L))).isTrue();
+        assertThat(commits).hasValue(0);
+    }
+
     private static Map<TableBucket, OffsetMetadata> sampleOffsets() {
         Map<TableBucket, OffsetMetadata> offsets = new HashMap<>();
         offsets.put(new TableBucket(1L, null, 0), new OffsetMetadata(10L, "metadata"));
@@ -370,8 +529,58 @@ class ConsumerGroupManagerTest {
                                                                 .setErrorMessage(message)))));
     }
 
+    private static GetConsumerOffsetsResponse fetchResponse() {
+        return new GetConsumerOffsetsResponse()
+                .addAllTables(
+                        Collections.singletonList(
+                                new PbGetConsumerOffsetsResponseTable()
+                                        .setTableId(1L)
+                                        .addAllBuckets(
+                                                Arrays.asList(
+                                                        new PbGetConsumerOffsetsResponseBucket()
+                                                                .setBucketId(1)
+                                                                .setOffset(11L)
+                                                                .setMetadata("first"),
+                                                        new PbGetConsumerOffsetsResponseBucket()
+                                                                .setPartitionId(5L)
+                                                                .setBucketId(2)
+                                                                .setOffset(12L)
+                                                                .setMetadata("partitioned")))))
+                .addAllTables(
+                        Collections.singletonList(
+                                new PbGetConsumerOffsetsResponseTable()
+                                        .setTableId(2L)
+                                        .addAllBuckets(
+                                                Collections.singletonList(
+                                                        new PbGetConsumerOffsetsResponseBucket()
+                                                                .setBucketId(3)))));
+    }
+
+    private static GetConsumerOffsetsResponse fetchErrorResponse(Errors error) {
+        return new GetConsumerOffsetsResponse()
+                .addAllTables(
+                        Collections.singletonList(
+                                new PbGetConsumerOffsetsResponseTable()
+                                        .setTableId(1L)
+                                        .addAllBuckets(
+                                                Collections.singletonList(
+                                                        new PbGetConsumerOffsetsResponseBucket()
+                                                                .setBucketId(0)
+                                                                .setErrorCode(error.code())))));
+    }
+
     private static TestTabletServerGateway gateway(
             OwnerRequestHandler ownerHandler, CommitRequestHandler commitHandler) {
+        return gateway(
+                ownerHandler,
+                commitHandler,
+                request -> CompletableFuture.completedFuture(new GetConsumerOffsetsResponse()));
+    }
+
+    private static TestTabletServerGateway gateway(
+            OwnerRequestHandler ownerHandler,
+            CommitRequestHandler commitHandler,
+            FetchRequestHandler fetchHandler) {
         return new TestTabletServerGateway(false, Collections.emptySet()) {
             @Override
             public CompletableFuture<FindConsumerGroupOwnerResponse> findConsumerGroupOwner(
@@ -383,6 +592,12 @@ class ConsumerGroupManagerTest {
             public CompletableFuture<CommitConsumerOffsetsResponse> commitConsumerOffsets(
                     CommitConsumerOffsetsRequest request) {
                 return commitHandler.handle(request);
+            }
+
+            @Override
+            public CompletableFuture<GetConsumerOffsetsResponse> getConsumerOffsets(
+                    GetConsumerOffsetsRequest request) {
+                return fetchHandler.handle(request);
             }
         };
     }
@@ -434,12 +649,30 @@ class ConsumerGroupManagerTest {
                 CommitConsumerOffsetsRequest request);
     }
 
+    private interface FetchRequestHandler {
+        CompletableFuture<GetConsumerOffsetsResponse> handle(GetConsumerOffsetsRequest request);
+    }
+
     private static final class ManualTime implements Time {
         private long nowMs;
 
         @Override
         public long milliseconds() {
             return nowMs;
+        }
+
+        @Override
+        public void sleep(long ms) {
+            nowMs += ms;
+        }
+    }
+
+    private static final class AdvancingTime implements Time {
+        private long nowMs;
+
+        @Override
+        public long milliseconds() {
+            return nowMs++;
         }
 
         @Override
