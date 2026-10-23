@@ -23,6 +23,7 @@ import org.apache.fluss.client.metadata.KvSnapshotMetadata;
 import org.apache.fluss.client.metadata.KvSnapshots;
 import org.apache.fluss.client.metadata.LakeSnapshot;
 import org.apache.fluss.client.metadata.RemoteLogManifestInfo;
+import org.apache.fluss.client.table.scanner.log.internals.OffsetMetadata;
 import org.apache.fluss.cluster.ServerNode;
 import org.apache.fluss.cluster.rebalance.GoalType;
 import org.apache.fluss.cluster.rebalance.RebalanceProgress;
@@ -80,6 +81,7 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 
 /**
@@ -645,6 +647,25 @@ public interface Admin extends AutoCloseable {
             String partitionName,
             Collection<Integer> buckets,
             OffsetSpec offsetSpec);
+
+    /** Alter the committed offsets of a consumer group. */
+    CompletableFuture<AlterConsumerOffsetsResult> alterConsumerGroupOffsets(
+            String groupId, Map<TableBucket, OffsetMetadata> newOffsets);
+
+    /** List committed offsets of a consumer group. */
+    CompletableFuture<ConsumerGroupOffsetsResult> listConsumerGroupOffsets(
+            String groupId, ListConsumerGroupOffsetsOptions options);
+
+    /** List consumer groups hosted across all tablet servers. */
+    CompletableFuture<Collection<ConsumerGroupListing>> listConsumerGroups(
+            ListConsumerGroupsOptions options);
+
+    /** Delete consumer groups independently. */
+    DeleteConsumerGroupsResult deleteConsumerGroups(Collection<String> groupIds);
+
+    /** Delete committed offsets for selected buckets of a consumer group. */
+    DeleteConsumerGroupOffsetsResult deleteConsumerGroupOffsets(
+            String groupId, Set<TableBucket> buckets);
 
     /**
      * Asynchronously gets the statistics of this table.

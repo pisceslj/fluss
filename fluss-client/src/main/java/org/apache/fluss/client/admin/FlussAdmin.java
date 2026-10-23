@@ -24,15 +24,18 @@ import org.apache.fluss.client.metadata.KvSnapshots;
 import org.apache.fluss.client.metadata.LakeSnapshot;
 import org.apache.fluss.client.metadata.MetadataUpdater;
 import org.apache.fluss.client.metadata.RemoteLogManifestInfo;
+import org.apache.fluss.client.table.scanner.log.internals.OffsetMetadata;
 import org.apache.fluss.client.utils.ClientRpcMessageUtils;
 import org.apache.fluss.client.utils.ClientUtils;
 import org.apache.fluss.cluster.Cluster;
 import org.apache.fluss.cluster.ServerNode;
+import org.apache.fluss.cluster.ServerType;
 import org.apache.fluss.cluster.rebalance.GoalType;
 import org.apache.fluss.cluster.rebalance.RebalanceProgress;
 import org.apache.fluss.cluster.rebalance.ServerTag;
 import org.apache.fluss.config.cluster.AlterConfig;
 import org.apache.fluss.config.cluster.ConfigEntry;
+import org.apache.fluss.exception.ConsumerGroupOwnerNotAvailableException;
 import org.apache.fluss.exception.FlussRuntimeException;
 import org.apache.fluss.exception.InvalidServerTypeException;
 import org.apache.fluss.exception.LeaderNotAvailableException;
@@ -68,6 +71,8 @@ import org.apache.fluss.rpc.messages.AlterClusterConfigsRequest;
 import org.apache.fluss.rpc.messages.AlterDatabaseRequest;
 import org.apache.fluss.rpc.messages.AlterTableRequest;
 import org.apache.fluss.rpc.messages.CancelRebalanceRequest;
+import org.apache.fluss.rpc.messages.CommitConsumerOffsetsRequest;
+import org.apache.fluss.rpc.messages.CommitConsumerOffsetsResponse;
 import org.apache.fluss.rpc.messages.CreateAclsRequest;
 import org.apache.fluss.rpc.messages.CreateDatabaseRequest;
 import org.apache.fluss.rpc.messages.CreateTableFromLakeRequest;
@@ -75,6 +80,8 @@ import org.apache.fluss.rpc.messages.CreateTableFromLakeResponse;
 import org.apache.fluss.rpc.messages.CreateTableRequest;
 import org.apache.fluss.rpc.messages.DatabaseExistsRequest;
 import org.apache.fluss.rpc.messages.DatabaseExistsResponse;
+import org.apache.fluss.rpc.messages.DeleteConsumerGroupsRequest;
+import org.apache.fluss.rpc.messages.DeleteConsumerOffsetsRequest;
 import org.apache.fluss.rpc.messages.DeleteProducerOffsetsRequest;
 import org.apache.fluss.rpc.messages.DescribeBucketsRequest;
 import org.apache.fluss.rpc.messages.DescribeClusterConfigsRequest;
@@ -82,7 +89,9 @@ import org.apache.fluss.rpc.messages.DescribeClusterRequest;
 import org.apache.fluss.rpc.messages.DropAclsRequest;
 import org.apache.fluss.rpc.messages.DropDatabaseRequest;
 import org.apache.fluss.rpc.messages.DropTableRequest;
+import org.apache.fluss.rpc.messages.FindConsumerGroupOwnerRequest;
 import org.apache.fluss.rpc.messages.GetClusterHealthRequest;
+import org.apache.fluss.rpc.messages.GetConsumerOffsetsRequest;
 import org.apache.fluss.rpc.messages.GetDatabaseInfoRequest;
 import org.apache.fluss.rpc.messages.GetKvSnapshotMetadataRequest;
 import org.apache.fluss.rpc.messages.GetLakeSnapshotRequest;
@@ -93,6 +102,7 @@ import org.apache.fluss.rpc.messages.GetTableSchemaRequest;
 import org.apache.fluss.rpc.messages.GetTableStatsRequest;
 import org.apache.fluss.rpc.messages.GetTableStatsResponse;
 import org.apache.fluss.rpc.messages.ListAclsRequest;
+import org.apache.fluss.rpc.messages.ListConsumerGroupsRequest;
 import org.apache.fluss.rpc.messages.ListDatabasesRequest;
 import org.apache.fluss.rpc.messages.ListDatabasesResponse;
 import org.apache.fluss.rpc.messages.ListKvSnapshotsRequest;
@@ -105,8 +115,22 @@ import org.apache.fluss.rpc.messages.ListRemoteLogManifestsRequest;
 import org.apache.fluss.rpc.messages.ListTablesRequest;
 import org.apache.fluss.rpc.messages.ListTablesResponse;
 import org.apache.fluss.rpc.messages.PbAlterConfig;
+import org.apache.fluss.rpc.messages.PbCommitConsumerOffsetsRequestBucket;
+import org.apache.fluss.rpc.messages.PbCommitConsumerOffsetsRequestTable;
+import org.apache.fluss.rpc.messages.PbCommitConsumerOffsetsResponseBucket;
+import org.apache.fluss.rpc.messages.PbCommitConsumerOffsetsResponseTable;
+import org.apache.fluss.rpc.messages.PbDeleteConsumerOffsetsRequestBucket;
+import org.apache.fluss.rpc.messages.PbDeleteConsumerOffsetsRequestTable;
+import org.apache.fluss.rpc.messages.PbDeleteConsumerOffsetsResponseBucket;
+import org.apache.fluss.rpc.messages.PbDeleteConsumerOffsetsResponseTable;
+import org.apache.fluss.rpc.messages.PbDeletedGroup;
+import org.apache.fluss.rpc.messages.PbGetConsumerOffsetsRequestBucket;
+import org.apache.fluss.rpc.messages.PbGetConsumerOffsetsRequestTable;
+import org.apache.fluss.rpc.messages.PbGetConsumerOffsetsResponseBucket;
+import org.apache.fluss.rpc.messages.PbGetConsumerOffsetsResponseTable;
 import org.apache.fluss.rpc.messages.PbKeyValue;
 import org.apache.fluss.rpc.messages.PbListOffsetsRespForBucket;
+import org.apache.fluss.rpc.messages.PbListedGroup;
 import org.apache.fluss.rpc.messages.PbPartitionInfo;
 import org.apache.fluss.rpc.messages.PbTableInfo;
 import org.apache.fluss.rpc.messages.PbTablePath;
@@ -118,6 +142,7 @@ import org.apache.fluss.rpc.messages.RemoveServerTagRequest;
 import org.apache.fluss.rpc.messages.TableExistsRequest;
 import org.apache.fluss.rpc.messages.TableExistsResponse;
 import org.apache.fluss.rpc.protocol.ApiError;
+import org.apache.fluss.rpc.protocol.Errors;
 import org.apache.fluss.security.acl.AclBinding;
 import org.apache.fluss.security.acl.AclBindingFilter;
 import org.apache.fluss.utils.ExceptionUtils;
@@ -130,9 +155,11 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
@@ -756,6 +783,338 @@ public class FlussAdmin implements Admin {
             Collection<Integer> buckets,
             OffsetSpec offsetSpec) {
         return listOffsets(PhysicalTablePath.of(tablePath, partitionName), buckets, offsetSpec);
+    }
+
+    @Override
+    public CompletableFuture<AlterConsumerOffsetsResult> alterConsumerGroupOffsets(
+            String groupId, Map<TableBucket, OffsetMetadata> newOffsets) {
+        checkNotNull(groupId, "groupId");
+        checkNotNull(newOffsets, "newOffsets");
+        CommitConsumerOffsetsRequest request = buildCommitOffsetsRequest(groupId, newOffsets);
+        return groupOwnerGateway(groupId)
+                .thenCompose(owner -> owner.commitConsumerOffsets(request))
+                .thenApply(response -> decodeAlterConsumerOffsets(response, newOffsets));
+    }
+
+    @Override
+    public CompletableFuture<ConsumerGroupOffsetsResult> listConsumerGroupOffsets(
+            String groupId, ListConsumerGroupOffsetsOptions options) {
+        checkNotNull(groupId, "groupId");
+        Set<TableBucket> requested = options == null ? null : options.buckets();
+        GetConsumerOffsetsRequest request = buildGetConsumerOffsetsRequest(groupId, requested);
+        return groupOwnerGateway(groupId)
+                .thenCompose(owner -> owner.getConsumerOffsets(request))
+                .thenApply(response -> decodeConsumerGroupOffsets(groupId, response));
+    }
+
+    @Override
+    public CompletableFuture<Collection<ConsumerGroupListing>> listConsumerGroups(
+            ListConsumerGroupsOptions options) {
+        List<CompletableFuture<List<ConsumerGroupListing>>> requests = new ArrayList<>();
+        for (ServerNode server : metadataUpdater.getCluster().getAliveTabletServerList()) {
+            TabletServerGateway tabletServer =
+                    metadataUpdater.newTabletServerClientForNode(server.id());
+            if (tabletServer == null) {
+                return failedFuture(
+                        new FlussRuntimeException(
+                                "No gateway is available for tablet server " + server.id()));
+            }
+            requests.add(
+                    tabletServer
+                            .listConsumerGroups(new ListConsumerGroupsRequest())
+                            .thenApply(
+                                    response -> {
+                                        List<ConsumerGroupListing> groups = new ArrayList<>();
+                                        for (PbListedGroup group : response.getGroupsList()) {
+                                            groups.add(
+                                                    new ConsumerGroupListing(group.getGroupId()));
+                                        }
+                                        return groups;
+                                    }));
+        }
+        if (requests.isEmpty()) {
+            return CompletableFuture.completedFuture(Collections.emptyList());
+        }
+        return CompletableFuture.allOf(requests.toArray(new CompletableFuture[0]))
+                .thenApply(
+                        ignored -> {
+                            Map<String, ConsumerGroupListing> groups = new LinkedHashMap<>();
+                            for (CompletableFuture<List<ConsumerGroupListing>> request : requests) {
+                                for (ConsumerGroupListing group : request.join()) {
+                                    groups.putIfAbsent(group.groupId(), group);
+                                }
+                            }
+                            return new ArrayList<>(groups.values());
+                        });
+    }
+
+    @Override
+    public DeleteConsumerGroupsResult deleteConsumerGroups(Collection<String> groupIds) {
+        checkNotNull(groupIds, "groupIds");
+        Map<String, CompletableFuture<Void>> results = new LinkedHashMap<>();
+        for (String groupId : groupIds) {
+            checkNotNull(groupId, "groupId");
+            DeleteConsumerGroupsRequest request = new DeleteConsumerGroupsRequest();
+            request.addGroup(groupId);
+            CompletableFuture<Void> result =
+                    groupOwnerGateway(groupId)
+                            .thenCompose(owner -> owner.deleteConsumerGroups(request))
+                            .thenApply(
+                                    response -> {
+                                        for (PbDeletedGroup group : response.getGroupsList()) {
+                                            if (groupId.equals(group.getGroupId())) {
+                                                Errors error =
+                                                        group.hasErrorCode()
+                                                                ? Errors.forCode(
+                                                                        group.getErrorCode())
+                                                                : Errors.NONE;
+                                                if (error != Errors.NONE) {
+                                                    throw error.exception(
+                                                            group.hasErrorMessage()
+                                                                    ? group.getErrorMessage()
+                                                                    : null);
+                                                }
+                                                return null;
+                                            }
+                                        }
+                                        throw new FlussRuntimeException(
+                                                "DeleteConsumerGroups response is missing group "
+                                                        + groupId);
+                                    });
+            results.put(groupId, result);
+        }
+        return new DeleteConsumerGroupsResult(results);
+    }
+
+    @Override
+    public DeleteConsumerGroupOffsetsResult deleteConsumerGroupOffsets(
+            String groupId, Set<TableBucket> buckets) {
+        checkNotNull(groupId, "groupId");
+        checkNotNull(buckets, "buckets");
+        Map<TableBucket, CompletableFuture<Void>> results = new LinkedHashMap<>();
+        for (TableBucket bucket : buckets) {
+            results.put(checkNotNull(bucket, "tableBucket"), new CompletableFuture<>());
+        }
+        if (results.isEmpty()) {
+            return new DeleteConsumerGroupOffsetsResult(results);
+        }
+
+        DeleteConsumerOffsetsRequest request = buildDeleteConsumerOffsetsRequest(groupId, buckets);
+        groupOwnerGateway(groupId)
+                .thenCompose(owner -> owner.deleteConsumerOffsets(request))
+                .whenComplete(
+                        (response, failure) -> {
+                            if (failure != null) {
+                                results.values()
+                                        .forEach(future -> future.completeExceptionally(failure));
+                                return;
+                            }
+                            Map<TableBucket, Errors> errors = decodeDeleteOffsetErrors(response);
+                            results.forEach(
+                                    (bucket, future) -> {
+                                        Errors error = errors.getOrDefault(bucket, Errors.NONE);
+                                        if (error == Errors.NONE) {
+                                            future.complete(null);
+                                        } else {
+                                            future.completeExceptionally(error.exception());
+                                        }
+                                    });
+                        });
+        return new DeleteConsumerGroupOffsetsResult(results);
+    }
+
+    private CompletableFuture<TabletServerGateway> groupOwnerGateway(String groupId) {
+        ServerNode discoveryNode = metadataUpdater.getRandomTabletServer();
+        if (discoveryNode == null) {
+            return failedFuture(
+                    new ConsumerGroupOwnerNotAvailableException(
+                            "No tablet server is known while discovering owner for " + groupId));
+        }
+        TabletServerGateway discoveryGateway =
+                metadataUpdater.newTabletServerClientForNode(discoveryNode.id());
+        if (discoveryGateway == null) {
+            return failedFuture(
+                    new ConsumerGroupOwnerNotAvailableException(
+                            "No gateway is available while discovering owner for " + groupId));
+        }
+        return discoveryGateway
+                .findConsumerGroupOwner(new FindConsumerGroupOwnerRequest().setGroupId(groupId))
+                .thenApply(
+                        response -> {
+                            if (response == null || !response.hasOwner()) {
+                                throw new ConsumerGroupOwnerNotAvailableException(
+                                        "FindConsumerGroupOwner returned no owner for " + groupId);
+                            }
+                            ServerNode owner =
+                                    new ServerNode(
+                                            response.getOwner().getNodeId(),
+                                            response.getOwner().getHost(),
+                                            response.getOwner().getPort(),
+                                            ServerType.TABLET_SERVER);
+                            TabletServerGateway gateway =
+                                    metadataUpdater.newTabletServerClientForNode(owner.id());
+                            if (gateway == null) {
+                                throw new ConsumerGroupOwnerNotAvailableException(
+                                        "No gateway is available for group owner " + owner.id());
+                            }
+                            return gateway;
+                        });
+    }
+
+    private CommitConsumerOffsetsRequest buildCommitOffsetsRequest(
+            String groupId, Map<TableBucket, OffsetMetadata> offsets) {
+        Map<Long, List<PbCommitConsumerOffsetsRequestBucket>> byTable = new LinkedHashMap<>();
+        offsets.forEach(
+                (tableBucket, offset) -> {
+                    PbCommitConsumerOffsetsRequestBucket bucket =
+                            new PbCommitConsumerOffsetsRequestBucket()
+                                    .setBucketId(tableBucket.getBucket())
+                                    .setOffset(offset.getOffset())
+                                    .setMetadata(offset.getMetadata());
+                    if (tableBucket.getPartitionId() != null) {
+                        bucket.setPartitionId(tableBucket.getPartitionId());
+                    }
+                    byTable.computeIfAbsent(tableBucket.getTableId(), ignored -> new ArrayList<>())
+                            .add(bucket);
+                });
+        CommitConsumerOffsetsRequest request =
+                new CommitConsumerOffsetsRequest().setGroupId(groupId);
+        byTable.forEach(
+                (tableId, bucketsForTable) ->
+                        request.addAllTables(
+                                Collections.singletonList(
+                                        new PbCommitConsumerOffsetsRequestTable()
+                                                .setTableId(tableId)
+                                                .addAllBuckets(bucketsForTable))));
+        return request;
+    }
+
+    private AlterConsumerOffsetsResult decodeAlterConsumerOffsets(
+            CommitConsumerOffsetsResponse response,
+            Map<TableBucket, OffsetMetadata> requestedOffsets) {
+        Map<TableBucket, AlterConsumerOffsetsResult.BucketOutcome> outcomes = new LinkedHashMap<>();
+        for (PbCommitConsumerOffsetsResponseTable table : response.getTablesList()) {
+            for (PbCommitConsumerOffsetsResponseBucket bucket : table.getBucketsList()) {
+                TableBucket tableBucket =
+                        new TableBucket(
+                                table.getTableId(),
+                                bucket.hasPartitionId() ? bucket.getPartitionId() : null,
+                                bucket.getBucketId());
+                Errors error =
+                        bucket.hasErrorCode() ? Errors.forCode(bucket.getErrorCode()) : Errors.NONE;
+                OffsetMetadata requested = requestedOffsets.get(tableBucket);
+                outcomes.put(
+                        tableBucket,
+                        new AlterConsumerOffsetsResult.BucketOutcome(
+                                error == Errors.NONE && requested != null
+                                        ? requested.getOffset()
+                                        : -1L,
+                                error.name(),
+                                bucket.hasErrorMessage() ? bucket.getErrorMessage() : null));
+            }
+        }
+        return new AlterConsumerOffsetsResult(outcomes);
+    }
+
+    private GetConsumerOffsetsRequest buildGetConsumerOffsetsRequest(
+            String groupId, Set<TableBucket> buckets) {
+        GetConsumerOffsetsRequest request = new GetConsumerOffsetsRequest().setGroupId(groupId);
+        if (buckets == null || buckets.isEmpty()) {
+            return request.setAllOffsets(true);
+        }
+        request.setAllOffsets(false);
+        Map<Long, List<PbGetConsumerOffsetsRequestBucket>> byTable = new LinkedHashMap<>();
+        for (TableBucket tableBucket : buckets) {
+            PbGetConsumerOffsetsRequestBucket bucket =
+                    new PbGetConsumerOffsetsRequestBucket().setBucketId(tableBucket.getBucket());
+            if (tableBucket.getPartitionId() != null) {
+                bucket.setPartitionId(tableBucket.getPartitionId());
+            }
+            byTable.computeIfAbsent(tableBucket.getTableId(), ignored -> new ArrayList<>())
+                    .add(bucket);
+        }
+        byTable.forEach(
+                (tableId, bucketsForTable) ->
+                        request.addAllTables(
+                                Collections.singletonList(
+                                        new PbGetConsumerOffsetsRequestTable()
+                                                .setTableId(tableId)
+                                                .addAllBuckets(bucketsForTable))));
+        return request;
+    }
+
+    private ConsumerGroupOffsetsResult decodeConsumerGroupOffsets(
+            String groupId, org.apache.fluss.rpc.messages.GetConsumerOffsetsResponse response) {
+        Map<TableBucket, ConsumerGroupOffsetsResult.Entry> entries = new LinkedHashMap<>();
+        for (PbGetConsumerOffsetsResponseTable table : response.getTablesList()) {
+            for (PbGetConsumerOffsetsResponseBucket bucket : table.getBucketsList()) {
+                Errors error =
+                        bucket.hasErrorCode() ? Errors.forCode(bucket.getErrorCode()) : Errors.NONE;
+                if (error != Errors.NONE) {
+                    throw error.exception(
+                            bucket.hasErrorMessage() ? bucket.getErrorMessage() : null);
+                }
+                if (bucket.hasOffset()) {
+                    entries.put(
+                            new TableBucket(
+                                    table.getTableId(),
+                                    bucket.hasPartitionId() ? bucket.getPartitionId() : null,
+                                    bucket.getBucketId()),
+                            new ConsumerGroupOffsetsResult.Entry(
+                                    bucket.getOffset(),
+                                    bucket.hasMetadata() ? bucket.getMetadata() : ""));
+                }
+            }
+        }
+        return new ConsumerGroupOffsetsResult(groupId, entries);
+    }
+
+    private DeleteConsumerOffsetsRequest buildDeleteConsumerOffsetsRequest(
+            String groupId, Set<TableBucket> buckets) {
+        Map<Long, List<PbDeleteConsumerOffsetsRequestBucket>> byTable = new LinkedHashMap<>();
+        for (TableBucket tableBucket : buckets) {
+            PbDeleteConsumerOffsetsRequestBucket bucket =
+                    new PbDeleteConsumerOffsetsRequestBucket().setBucketId(tableBucket.getBucket());
+            if (tableBucket.getPartitionId() != null) {
+                bucket.setPartitionId(tableBucket.getPartitionId());
+            }
+            byTable.computeIfAbsent(tableBucket.getTableId(), ignored -> new ArrayList<>())
+                    .add(bucket);
+        }
+        DeleteConsumerOffsetsRequest request =
+                new DeleteConsumerOffsetsRequest().setGroupId(groupId);
+        byTable.forEach(
+                (tableId, bucketsForTable) ->
+                        request.addAllTables(
+                                Collections.singletonList(
+                                        new PbDeleteConsumerOffsetsRequestTable()
+                                                .setTableId(tableId)
+                                                .addAllBuckets(bucketsForTable))));
+        return request;
+    }
+
+    private Map<TableBucket, Errors> decodeDeleteOffsetErrors(
+            org.apache.fluss.rpc.messages.DeleteConsumerOffsetsResponse response) {
+        Map<TableBucket, Errors> errors = new HashMap<>();
+        for (PbDeleteConsumerOffsetsResponseTable table : response.getTablesList()) {
+            for (PbDeleteConsumerOffsetsResponseBucket bucket : table.getBucketsList()) {
+                errors.put(
+                        new TableBucket(
+                                table.getTableId(),
+                                bucket.hasPartitionId() ? bucket.getPartitionId() : null,
+                                bucket.getBucketId()),
+                        bucket.hasErrorCode()
+                                ? Errors.forCode(bucket.getErrorCode())
+                                : Errors.NONE);
+            }
+        }
+        return errors;
+    }
+
+    private static <T> CompletableFuture<T> failedFuture(Throwable failure) {
+        CompletableFuture<T> future = new CompletableFuture<>();
+        future.completeExceptionally(failure);
+        return future;
     }
 
     @Override
