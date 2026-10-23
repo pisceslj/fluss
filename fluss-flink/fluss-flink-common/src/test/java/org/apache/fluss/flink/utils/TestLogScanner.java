@@ -20,6 +20,8 @@ package org.apache.fluss.flink.utils;
 import org.apache.fluss.client.table.scanner.ScanRecord;
 import org.apache.fluss.client.table.scanner.log.LogScanner;
 import org.apache.fluss.client.table.scanner.log.ScanRecords;
+import org.apache.fluss.client.table.scanner.log.internals.OffsetCommitCallback;
+import org.apache.fluss.client.table.scanner.log.internals.OffsetMetadata;
 import org.apache.fluss.metadata.TableBucket;
 
 import java.time.Duration;
@@ -135,13 +137,41 @@ public class TestLogScanner implements LogScanner {
     public void subscribe(int bucket, long offset) {}
 
     @Override
+    public void subscribeFromCommittedOffset(int bucket) {}
+
+    @Override
     public void subscribe(long partitionId, int bucket, long offset) {}
+
+    @Override
+    public void subscribeFromCommittedOffset(long partitionId, int bucket) {}
 
     @Override
     public void unsubscribe(long partitionId, int bucket) {}
 
     @Override
     public void unsubscribe(int bucket) {}
+
+    @Override
+    public void commitSync() {}
+
+    @Override
+    public void commitSync(Duration timeout) {}
+
+    @Override
+    public void commitSync(Map<TableBucket, OffsetMetadata> offsets) {}
+
+    @Override
+    public void commitSync(Map<TableBucket, OffsetMetadata> offsets, Duration timeout) {}
+
+    @Override
+    public void commitAsync() {}
+
+    @Override
+    public void commitAsync(OffsetCommitCallback callback) {}
+
+    @Override
+    public void commitAsync(
+            Map<TableBucket, OffsetMetadata> offsets, OffsetCommitCallback callback) {}
 
     @Override
     public void wakeup() {}

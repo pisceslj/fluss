@@ -18,11 +18,18 @@
 package org.apache.fluss.flink.sink.testutils;
 
 import org.apache.fluss.client.admin.Admin;
+import org.apache.fluss.client.admin.AlterConsumerOffsetsResult;
 import org.apache.fluss.client.admin.ClusterDescription;
 import org.apache.fluss.client.admin.ClusterHealth;
+import org.apache.fluss.client.admin.ConsumerGroupListing;
+import org.apache.fluss.client.admin.ConsumerGroupOffsetsResult;
 import org.apache.fluss.client.admin.CreateAclsResult;
+import org.apache.fluss.client.admin.DeleteConsumerGroupOffsetsResult;
+import org.apache.fluss.client.admin.DeleteConsumerGroupsResult;
 import org.apache.fluss.client.admin.DropAclsResult;
 import org.apache.fluss.client.admin.KvSnapshotLease;
+import org.apache.fluss.client.admin.ListConsumerGroupOffsetsOptions;
+import org.apache.fluss.client.admin.ListConsumerGroupsOptions;
 import org.apache.fluss.client.admin.ListOffsetsResult;
 import org.apache.fluss.client.admin.OffsetSpec;
 import org.apache.fluss.client.admin.ProducerOffsetsResult;
@@ -32,6 +39,7 @@ import org.apache.fluss.client.metadata.KvSnapshotMetadata;
 import org.apache.fluss.client.metadata.KvSnapshots;
 import org.apache.fluss.client.metadata.LakeSnapshot;
 import org.apache.fluss.client.metadata.RemoteLogManifestInfo;
+import org.apache.fluss.client.table.scanner.log.internals.OffsetMetadata;
 import org.apache.fluss.cluster.ServerNode;
 import org.apache.fluss.cluster.rebalance.GoalType;
 import org.apache.fluss.cluster.rebalance.RebalanceProgress;
@@ -61,6 +69,7 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 
 /**
@@ -255,6 +264,35 @@ public class TestAdminAdapter implements Admin {
             String partitionName,
             Collection<Integer> buckets,
             OffsetSpec offsetSpec) {
+        throw new UnsupportedOperationException("Not implemented in TestAdminAdapter");
+    }
+
+    @Override
+    public CompletableFuture<AlterConsumerOffsetsResult> alterConsumerGroupOffsets(
+            String groupId, Map<TableBucket, OffsetMetadata> newOffsets) {
+        throw new UnsupportedOperationException("Not implemented in TestAdminAdapter");
+    }
+
+    @Override
+    public CompletableFuture<ConsumerGroupOffsetsResult> listConsumerGroupOffsets(
+            String groupId, ListConsumerGroupOffsetsOptions options) {
+        throw new UnsupportedOperationException("Not implemented in TestAdminAdapter");
+    }
+
+    @Override
+    public CompletableFuture<Collection<ConsumerGroupListing>> listConsumerGroups(
+            ListConsumerGroupsOptions options) {
+        throw new UnsupportedOperationException("Not implemented in TestAdminAdapter");
+    }
+
+    @Override
+    public DeleteConsumerGroupsResult deleteConsumerGroups(Collection<String> groupIds) {
+        throw new UnsupportedOperationException("Not implemented in TestAdminAdapter");
+    }
+
+    @Override
+    public DeleteConsumerGroupOffsetsResult deleteConsumerGroupOffsets(
+            String groupId, Set<TableBucket> buckets) {
         throw new UnsupportedOperationException("Not implemented in TestAdminAdapter");
     }
 
