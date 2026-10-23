@@ -18,9 +18,13 @@
 package org.apache.fluss.client.table.scanner.log;
 
 import org.apache.fluss.annotation.PublicEvolving;
+import org.apache.fluss.client.table.scanner.log.internals.OffsetCommitCallback;
+import org.apache.fluss.client.table.scanner.log.internals.OffsetMetadata;
+import org.apache.fluss.metadata.TableBucket;
 import org.apache.fluss.metadata.TablePath;
 
 import java.time.Duration;
+import java.util.Map;
 
 /**
  * Reads log data from multiple tables through a single client. All subscribed buckets (across
@@ -70,6 +74,9 @@ public interface MultiTableLogScanner extends AutoCloseable {
     /** Subscribe to the given non-partitioned table bucket starting at {@code offset}. */
     void subscribe(TablePath tablePath, int bucket, long offset);
 
+    /** Subscribe using the group's committed offset, or the configured reset policy. */
+    void subscribeFromCommittedOffset(TablePath tablePath, int bucket);
+
     /** Subscribe to the given non-partitioned table bucket starting from the earliest offset. */
     default void subscribeFromBeginning(TablePath tablePath, int bucket) {
         subscribe(tablePath, bucket, EARLIEST_OFFSET);
@@ -83,6 +90,9 @@ public interface MultiTableLogScanner extends AutoCloseable {
     /** Subscribe to the given partitioned table bucket starting at {@code offset}. */
     void subscribe(TablePath tablePath, long partitionId, int bucket, long offset);
 
+    /** Subscribe using the group's committed offset, or the configured reset policy. */
+    void subscribeFromCommittedOffset(TablePath tablePath, long partitionId, int bucket);
+
     /** Subscribe to the given partitioned table bucket starting from the earliest offset. */
     default void subscribeFromBeginning(TablePath tablePath, long partitionId, int bucket) {
         subscribe(tablePath, partitionId, bucket, EARLIEST_OFFSET);
@@ -90,6 +100,20 @@ public interface MultiTableLogScanner extends AutoCloseable {
 
     /** Unsubscribe from the given partitioned table bucket. */
     void unsubscribe(TablePath tablePath, long partitionId, int bucket);
+
+    void commitSync();
+
+    void commitSync(Duration timeout);
+
+    void commitSync(Map<TableBucket, OffsetMetadata> offsets);
+
+    void commitSync(Map<TableBucket, OffsetMetadata> offsets, Duration timeout);
+
+    void commitAsync();
+
+    void commitAsync(OffsetCommitCallback callback);
+
+    void commitAsync(Map<TableBucket, OffsetMetadata> offsets, OffsetCommitCallback callback);
 
     /**
      * Wake up the log scanner in case the fetcher thread in the log scanner is blocking in {@link

@@ -18,8 +18,21 @@
 package org.apache.fluss.client.table.scanner.log;
 
 import org.apache.fluss.annotation.Internal;
+import org.apache.fluss.client.metadata.MetadataUpdater;
 import org.apache.fluss.client.metrics.ScannerMetricGroup;
+import org.apache.fluss.client.table.scanner.log.internals.ConsumerConfig;
+import org.apache.fluss.client.table.scanner.log.internals.ConsumerGroupManager;
+import org.apache.fluss.client.table.scanner.log.internals.OffsetCommitCallback;
+import org.apache.fluss.client.table.scanner.log.internals.OffsetMetadata;
+import org.apache.fluss.client.table.scanner.log.internals.utils.Time;
+import org.apache.fluss.client.table.scanner.log.internals.utils.Timer;
+import org.apache.fluss.config.ConfigOptions;
+import org.apache.fluss.config.Configuration;
+import org.apache.fluss.exception.InvalidConfigException;
+import org.apache.fluss.exception.InvalidConsumerGroupIdException;
+import org.apache.fluss.exception.TimeoutException;
 import org.apache.fluss.exception.WakeupException;
+import org.apache.fluss.metadata.TableBucket;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -27,6 +40,9 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.time.Duration;
 import java.util.ConcurrentModificationException;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -49,6 +65,10 @@ abstract class AbstractLogScanner<R> implements AutoCloseable {
     protected final LogScannerStatus logScannerStatus;
     protected final LogFetcher logFetcher;
     protected final ScannerMetricGroup scannerMetricGroup;
+    private final ConsumerGroupManager consumerGroupManager;
+    private final Time time;
+    private final long defaultApiTimeoutMs;
+    private final String offsetResetPolicy;
 
     private volatile boolean closed = false;
 
@@ -62,12 +82,46 @@ abstract class AbstractLogScanner<R> implements AutoCloseable {
             String name,
             LogScannerStatus logScannerStatus,
             LogFetcher logFetcher,
-            ScannerMetricGroup scannerMetricGroup) {
+            ScannerMetricGroup scannerMetricGroup,
+            Configuration conf,
+            MetadataUpdater metadataUpdater) {
         this.name = name;
         this.logScannerStatus = logScannerStatus;
         this.logFetcher = logFetcher;
         this.scannerMetricGroup = scannerMetricGroup;
         this.scannerMetricGroup.registerRecordsLagGauge(logScannerStatus::recordsLag);
+        this.time = Time.SYSTEM;
+        this.defaultApiTimeoutMs = conf.get(ConfigOptions.CLIENT_REQUEST_TIMEOUT).toMillis();
+        this.offsetResetPolicy =
+                conf.getString(ConsumerConfig.AUTO_OFFSET_RESET).toLowerCase(Locale.ROOT);
+        if (!offsetResetPolicy.equals("earliest")
+                && !offsetResetPolicy.equals("latest")
+                && !offsetResetPolicy.equals("none")) {
+            throw new InvalidConfigException(
+                    "Unsupported "
+                            + ConsumerConfig.AUTO_OFFSET_RESET.key()
+                            + ": "
+                            + offsetResetPolicy);
+        }
+
+        String groupId = conf.getString(ConsumerConfig.GROUP_ID);
+        boolean autoCommitEnabled = conf.getBoolean(ConsumerConfig.ENABLE_AUTO_COMMIT);
+        if (groupId == null) {
+            if (autoCommitEnabled && conf.containsKey(ConsumerConfig.ENABLE_AUTO_COMMIT.key())) {
+                throw new InvalidConfigException(
+                        ConsumerConfig.ENABLE_AUTO_COMMIT.key()
+                                + " cannot be true without "
+                                + ConsumerConfig.GROUP_ID.key());
+            }
+            this.consumerGroupManager = null;
+        } else {
+            this.consumerGroupManager =
+                    new ConsumerGroupManager(
+                            groupId,
+                            metadataUpdater,
+                            autoCommitEnabled,
+                            conf.get(ConsumerConfig.AUTO_COMMIT_INTERVAL).toMillis());
+        }
     }
 
     /**
@@ -87,6 +141,12 @@ abstract class AbstractLogScanner<R> implements AutoCloseable {
             if (!logScannerStatus.prepareToPoll()) {
                 throw new IllegalStateException(notSubscribedMessage());
             }
+
+            Timer timer = time.timer(timeout);
+            if (!initializeCommittedOffsets(timer)) {
+                return emptyResult();
+            }
+            maybeAutoCommit();
 
             scannerMetricGroup.recordPollStart(System.currentTimeMillis());
             long timeoutNanos = timeout.toNanos();
@@ -143,6 +203,87 @@ abstract class AbstractLogScanner<R> implements AutoCloseable {
         logFetcher.wakeup();
     }
 
+    protected final void subscribeFromCommittedOffset(TableBucket tableBucket) {
+        requireConsumerGroup();
+        logScannerStatus.assignFromCommittedOffset(tableBucket);
+    }
+
+    protected final boolean initializeCommittedOffsets(Timer timer) {
+        if (consumerGroupManager == null) {
+            return true;
+        }
+        java.util.Set<TableBucket> missing = logScannerStatus.missingCommittedOffsets();
+        if (missing.isEmpty()) {
+            return true;
+        }
+        Map<TableBucket, OffsetMetadata> committed =
+                consumerGroupManager.fetchCommittedOffsets(missing, timer);
+        if (committed == null) {
+            return false;
+        }
+        logScannerStatus.resolveCommittedOffsets(committed, offsetResetPolicy);
+        return true;
+    }
+
+    protected final void maybeAutoCommit() {
+        if (consumerGroupManager != null) {
+            consumerGroupManager.maybeAutoCommitOffsetsAsync(
+                    time.milliseconds(), logScannerStatus.allConsumed());
+        }
+    }
+
+    public final void commitSync() {
+        commitSync(Duration.ofMillis(defaultApiTimeoutMs));
+    }
+
+    public final void commitSync(Duration timeout) {
+        commitSync(logScannerStatus.allConsumed(), timeout);
+    }
+
+    public final void commitSync(Map<TableBucket, OffsetMetadata> offsets) {
+        commitSync(offsets, Duration.ofMillis(defaultApiTimeoutMs));
+    }
+
+    public final void commitSync(Map<TableBucket, OffsetMetadata> offsets, Duration timeout) {
+        acquireAndEnsureOpen();
+        try {
+            requireConsumerGroup();
+            if (!consumerGroupManager.commitOffsetsSync(
+                    Objects.requireNonNull(offsets), time.timer(timeout))) {
+                throw new TimeoutException(
+                        "Timed out after " + timeout.toMillis() + " ms committing offsets");
+            }
+        } finally {
+            release();
+        }
+    }
+
+    public final void commitAsync() {
+        commitAsync((OffsetCommitCallback) null);
+    }
+
+    public final void commitAsync(OffsetCommitCallback callback) {
+        commitAsync(logScannerStatus.allConsumed(), callback);
+    }
+
+    public final void commitAsync(
+            Map<TableBucket, OffsetMetadata> offsets, OffsetCommitCallback callback) {
+        acquireAndEnsureOpen();
+        try {
+            requireConsumerGroup();
+            consumerGroupManager.commitOffsetsAsync(Objects.requireNonNull(offsets), callback);
+        } finally {
+            release();
+        }
+    }
+
+    private void requireConsumerGroup() {
+        if (consumerGroupManager == null) {
+            throw new InvalidConsumerGroupIdException(
+                    "Consumer offset operations require " + ConsumerConfig.GROUP_ID.key());
+        }
+    }
+
     /**
      * Acquire the light lock and ensure that the scanner hasn't been closed.
      *
@@ -194,6 +335,11 @@ abstract class AbstractLogScanner<R> implements AutoCloseable {
         try {
             if (!closed) {
                 LOG.trace("Closing log scanner: {}", name);
+                if (consumerGroupManager != null) {
+                    consumerGroupManager.maybeAutoCommitOffsetsSync(
+                            logScannerStatus.allConsumed(), time.timer(defaultApiTimeoutMs));
+                    consumerGroupManager.close();
+                }
                 scannerMetricGroup.close();
                 logFetcher.close();
             }

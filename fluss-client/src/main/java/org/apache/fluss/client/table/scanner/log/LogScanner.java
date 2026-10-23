@@ -18,8 +18,12 @@
 package org.apache.fluss.client.table.scanner.log;
 
 import org.apache.fluss.annotation.PublicEvolving;
+import org.apache.fluss.client.table.scanner.log.internals.OffsetCommitCallback;
+import org.apache.fluss.client.table.scanner.log.internals.OffsetMetadata;
+import org.apache.fluss.metadata.TableBucket;
 
 import java.time.Duration;
+import java.util.Map;
 
 /**
  * The scanner is used to scan log data of specify table from Fluss.
@@ -34,6 +38,9 @@ public interface LogScanner extends AutoCloseable {
      * offset.
      */
     long EARLIEST_OFFSET = -2L;
+
+    /** The latest offset to fetch from. */
+    long LATEST_OFFSET = -1L;
 
     /**
      * The latest offset to fetch to. Fluss uses this to indicate the default stopping offset for
@@ -68,6 +75,9 @@ public interface LogScanner extends AutoCloseable {
      */
     void subscribe(int bucket, long offset);
 
+    /** Subscribe using the group's committed offset, or the configured reset policy. */
+    void subscribeFromCommittedOffset(int bucket);
+
     /**
      * Subscribe to the given table buckets from beginning dynamically. If the table bucket is
      * already subscribed, the start offset will be updated.
@@ -96,6 +106,9 @@ public interface LogScanner extends AutoCloseable {
      * @throws java.lang.IllegalStateException if the table is a non-partitioned table.
      */
     void subscribe(long partitionId, int bucket, long offset);
+
+    /** Subscribe using the group's committed offset, or the configured reset policy. */
+    void subscribeFromCommittedOffset(long partitionId, int bucket);
 
     /**
      * Unsubscribe from the given bucket of given partition dynamically.
@@ -131,6 +144,20 @@ public interface LogScanner extends AutoCloseable {
     default void subscribeFromBeginning(long partitionId, int bucket) {
         subscribe(partitionId, bucket, EARLIEST_OFFSET);
     }
+
+    void commitSync();
+
+    void commitSync(Duration timeout);
+
+    void commitSync(Map<TableBucket, OffsetMetadata> offsets);
+
+    void commitSync(Map<TableBucket, OffsetMetadata> offsets, Duration timeout);
+
+    void commitAsync();
+
+    void commitAsync(OffsetCommitCallback callback);
+
+    void commitAsync(Map<TableBucket, OffsetMetadata> offsets, OffsetCommitCallback callback);
 
     /**
      * Wake up the log scanner in case the fetcher thread in log scanner is blocking in {@link
