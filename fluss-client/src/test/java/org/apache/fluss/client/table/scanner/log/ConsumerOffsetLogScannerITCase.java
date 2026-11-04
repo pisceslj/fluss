@@ -30,6 +30,7 @@ import org.apache.fluss.client.table.scanner.log.internals.ConsumerConfig;
 import org.apache.fluss.client.table.scanner.log.internals.OffsetMetadata;
 import org.apache.fluss.client.table.writer.AppendWriter;
 import org.apache.fluss.config.Configuration;
+import org.apache.fluss.exception.ConsumerGroupIdNotFoundException;
 import org.apache.fluss.metadata.LogFormat;
 import org.apache.fluss.metadata.Schema;
 import org.apache.fluss.metadata.TableBucket;
@@ -39,7 +40,9 @@ import org.apache.fluss.row.BinaryString;
 import org.apache.fluss.row.GenericRow;
 import org.apache.fluss.server.tablet.consumer.group.ConsumerOffsetSchema;
 import org.apache.fluss.types.DataTypes;
+import org.apache.fluss.utils.ExceptionUtils;
 
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -48,6 +51,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -61,6 +65,8 @@ class ConsumerOffsetLogScannerITCase extends ClientToServerITCaseBase {
                     .column("id", DataTypes.INT())
                     .column("value", DataTypes.STRING())
                     .build();
+
+    private String groupId;
 
     @BeforeEach
     void waitForConsumerOffsetsTable() throws Exception {
@@ -77,12 +83,29 @@ class ConsumerOffsetLogScannerITCase extends ClientToServerITCaseBase {
         waitAllReplicasReady(tableId, 1);
     }
 
+    @AfterEach
+    void deleteConsumerGroup() throws Exception {
+        if (groupId == null) {
+            return;
+        }
+        try {
+            admin.deleteConsumerGroups(Collections.singleton(groupId)).all().get();
+        } catch (ExecutionException e) {
+            // The lifecycle test may have deleted the group, or a failed test never created it.
+            if (!(ExceptionUtils.stripExecutionException(e)
+                    instanceof ConsumerGroupIdNotFoundException)) {
+                throw e;
+            }
+        }
+        waitForEmptyOffsets(groupId);
+    }
+
     @Test
     void testCommitAndResumeFromCommittedOffset() throws Exception {
         TablePath tablePath = uniqueTablePath("resume");
         long tableId = createTable(tablePath, descriptor(1), false);
         appendRows(tablePath, 5);
-        String groupId = "scanner-resume-" + System.nanoTime();
+        groupId = "scanner-resume-" + System.nanoTime();
         TableBucket tableBucket = new TableBucket(tableId, null, 0);
 
         try (Connection groupConnection = groupConnection(groupId, false);
@@ -122,7 +145,7 @@ class ConsumerOffsetLogScannerITCase extends ClientToServerITCaseBase {
         TablePath tablePath = uniqueTablePath("admin");
         long tableId = createTable(tablePath, descriptor(2), false);
         appendRows(tablePath, 8);
-        String groupId = "scanner-admin-" + System.nanoTime();
+        groupId = "scanner-admin-" + System.nanoTime();
         Map<TableBucket, OffsetMetadata> offsets = new HashMap<>();
         offsets.put(new TableBucket(tableId, null, 0), new OffsetMetadata(2L));
         offsets.put(new TableBucket(tableId, null, 1), new OffsetMetadata(3L));
@@ -155,7 +178,7 @@ class ConsumerOffsetLogScannerITCase extends ClientToServerITCaseBase {
     void testClosePerformsFinalAutoCommit() throws Exception {
         TablePath tablePath = uniqueTablePath("close");
         long tableId = createTable(tablePath, descriptor(1), false);
-        String groupId = "scanner-close-" + System.nanoTime();
+        groupId = "scanner-close-" + System.nanoTime();
         TableBucket tableBucket = new TableBucket(tableId, null, 0);
 
         try (Connection groupConnection = groupConnection(groupId, true);

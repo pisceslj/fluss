@@ -90,7 +90,7 @@ public class ConsumerGroupFailoverITCase extends ClientToServerITCaseBase {
 
         int bucketId =
                 FlussBucketingFunction.bucketForRowKey(
-                        ConsumerOffsetSchema.encodeGroupPrefix(groupId), bucketCount);
+                        new ConsumerOffsetSchema().encodeGroupBucketKey(groupId), bucketCount);
         TableBucket offsetsBucket = new TableBucket(offsetsTableId, null, bucketId);
         int oldLeader =
                 FLUSS_CLUSTER_EXTENSION
@@ -108,6 +108,7 @@ public class ConsumerGroupFailoverITCase extends ClientToServerITCaseBase {
             ConsumerGroupOffsetsResult after = waitForOffsets(freshAdmin, groupId);
             assertThat(after.entries().get(dataBucket).committedOffset).isEqualTo(17L);
             assertThat(after.entries().get(dataBucket).metadata).isEqualTo("before");
+            freshAdmin.deleteConsumerGroups(Collections.singleton(groupId)).all().get();
         }
     }
 

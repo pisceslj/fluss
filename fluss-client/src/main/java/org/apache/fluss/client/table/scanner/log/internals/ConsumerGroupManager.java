@@ -106,6 +106,7 @@ public final class ConsumerGroupManager implements AutoCloseable {
 
     /** The pending owner-discovery request; null while no discovery is in flight. */
     private CompletableFuture<ServerNode> ownerDiscovery;
+
     private final ConcurrentLinkedQueue<OffsetCommitCompletion> completedOffsetCommits =
             new ConcurrentLinkedQueue<>();
     private final AtomicReference<PendingCommittedOffsetRequest> pendingOffsetFetch =
